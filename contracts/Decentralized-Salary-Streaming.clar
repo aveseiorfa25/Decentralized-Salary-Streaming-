@@ -16,6 +16,8 @@
 (define-constant err-batch-size-exceeded (err u108))
 (define-constant err-cliff-not-reached (err u109))
 (define-constant err-vesting-schedule-exists (err u110))
+(define-constant err-stream-already-ended (err u111))
+(define-constant err-insufficient-time-elapsed (err u112))
 
 
 (define-map salary-streams
@@ -379,4 +381,52 @@
     (ok true))
 )
 
+(define-read-only (calculate-earned-amount (stream-id uint))
+  (let (
+    (stream (unwrap! (get-stream stream-id) (err u0)))
+    (current-time stacks-block-height)
+    (elapsed-time (- current-time (get start-time stream)))
+  )
+    (if (>= current-time (get end-time stream))
+      (ok (get total-amount stream))
+      (ok (* elapsed-time (get amount-per-second stream))))
+  )
+)
 
+(define-public (cancel-stream (stream-id uint))
+  (let (
+    (stream (unwrap! (get-stream stream-id) err-not-found))
+    (current-time stacks-block-height)
+    (earned-amount (unwrap! (calculate-earned-amount stream-id) err-invalid-amount))
+    (refund-amount (- (get total-amount stream) earned-amount))
+    (employee-payment (- earned-amount (get withdrawn-amount stream)))
+  )
+    (asserts! (is-eq tx-sender (get employer stream)) err-owner-only)
+    (asserts! (get is-active stream) err-stream-inactive)
+    (asserts! (< current-time (get end-time stream)) err-stream-already-ended)
+    (asserts! (> (- current-time (get start-time stream)) u10) err-insufficient-time-elapsed)
+    
+    (if (> employee-payment u0)
+      (try! (as-contract (stx-transfer? employee-payment (as-contract tx-sender) (get employee stream))))
+      true)
+    
+    (if (> refund-amount u0)
+      (begin
+        (map-set employer-deposits
+          { employer: (get employer stream) }
+          { balance: (+ (get balance (get-employer-balance (get employer stream))) refund-amount) }
+        )
+        true)
+      true)
+    
+    (map-set salary-streams
+      { stream-id: stream-id }
+      (merge stream {
+        is-active: false,
+        end-time: current-time,
+        withdrawn-amount: (+ (get withdrawn-amount stream) employee-payment)
+      })
+    )
+    
+    (ok { employee-payment: employee-payment, refund-amount: refund-amount }))
+)
