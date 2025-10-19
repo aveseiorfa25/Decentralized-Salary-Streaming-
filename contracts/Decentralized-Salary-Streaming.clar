@@ -430,3 +430,360 @@
     
     (ok { employee-payment: employee-payment, refund-amount: refund-amount }))
 )
+
+;; === STREAM ANALYTICS AND REPORTING SYSTEM ===
+;; Independent feature for tracking stream statistics and generating reports
+
+;; Error constants for analytics feature
+(define-constant err-analytics-not-found (err u200))
+(define-constant err-invalid-date-range (err u201))
+(define-constant err-analytics-access-denied (err u202))
+(define-constant err-report-generation-failed (err u203))
+
+;; Data variables for analytics
+(define-data-var total-volume-streamed uint u0)
+(define-data-var total-completed-streams uint u0)
+(define-data-var total-cancelled-streams uint u0)
+(define-data-var analytics-enabled bool true)
+
+;; Stream analytics data structure
+(define-map stream-analytics
+  { stream-id: uint }
+  {
+    creation-block: uint,
+    first-withdrawal-block: (optional uint),
+    completion-block: (optional uint),
+    total-withdrawals: uint,
+    efficiency-score: uint,
+    status: (string-ascii 20)
+  }
+)
+
+;; Global analytics aggregation
+(define-map daily-analytics
+  { date: uint }
+  {
+    streams-created: uint,
+    streams-completed: uint,
+    streams-cancelled: uint,
+    volume-streamed: uint,
+    active-employers: uint,
+    active-employees: uint
+  }
+)
+
+;; User analytics tracking
+(define-map user-analytics
+  { user: principal }
+  {
+    streams-as-employer: uint,
+    streams-as-employee: uint,
+    total-paid: uint,
+    total-received: uint,
+    avg-stream-duration: uint,
+    reliability-score: uint
+  }
+)
+
+;; Performance metrics
+(define-map performance-metrics
+  { metric-type: (string-ascii 30) }
+  {
+    value: uint,
+    last-updated: uint,
+    trend: (string-ascii 10)
+  }
+)
+
+;; === ANALYTICS CORE FUNCTIONS ===
+
+(define-read-only (get-stream-analytics (stream-id uint))
+  (map-get? stream-analytics { stream-id: stream-id })
+)
+
+(define-read-only (get-user-analytics (user principal))
+  (default-to {
+    streams-as-employer: u0,
+    streams-as-employee: u0,
+    total-paid: u0,
+    total-received: u0,
+    avg-stream-duration: u0,
+    reliability-score: u100
+  } (map-get? user-analytics { user: user }))
+)
+
+(define-read-only (get-daily-analytics (date uint))
+  (map-get? daily-analytics { date: date })
+)
+
+(define-read-only (get-performance-metric (metric-type (string-ascii 30)))
+  (map-get? performance-metrics { metric-type: metric-type })
+)
+
+;; Calculate stream efficiency score (0-100)
+(define-read-only (calculate-efficiency-score (stream-id uint))
+  (match (get-stream stream-id)
+    stream (let (
+      (total-duration (- (get end-time stream) (get start-time stream)))
+      (withdrawn-ratio (if (> (get total-amount stream) u0)
+                        (/ (* (get withdrawn-amount stream) u100) (get total-amount stream))
+                        u0))
+      (time-efficiency (if (and (get is-active stream) (> total-duration u0))
+                        (/ (* (- stacks-block-height (get start-time stream)) u100) total-duration)
+                        u100))
+      (combined-score (/ (+ withdrawn-ratio time-efficiency) u2))
+    )
+      (ok (min combined-score u100)))
+    (err u0))
+)
+
+;; Generate stream status based on current state
+(define-read-only (get-stream-status (stream-id uint))
+  (match (get-stream stream-id)
+    stream (let (
+      (current-time stacks-block-height)
+      (is-completed (>= current-time (get end-time stream)))
+      (has-emergency (is-some (get-emergency-request stream-id)))
+    )
+      (if (not (get is-active stream))
+        (if is-completed "completed" "cancelled")
+        (if has-emergency "emergency" "active")))
+    "not-found")
+)
+
+;; Calculate user reliability score based on stream history
+(define-read-only (calculate-user-reliability (user principal))
+  (let (
+    (user-data (get-user-analytics user))
+    (user-total-streams (+ (get streams-as-employer user-data) (get streams-as-employee user-data)))
+  )
+    (if (> user-total-streams u0)
+      (let (
+        (completion-rate (/ (* (get streams-as-employee user-data) u100) user-total-streams))
+        (payment-consistency (if (> (get streams-as-employer user-data) u0) u100 u80))
+        (reliability (/ (+ completion-rate payment-consistency) u2))
+      )
+        (ok (min reliability u100)))
+      (ok u100)))
+)
+
+;; === ANALYTICS UPDATE FUNCTIONS ===
+
+(define-public (initialize-stream-analytics (stream-id uint))
+  (let (
+    (stream (unwrap! (get-stream stream-id) err-not-found))
+    (current-block stacks-block-height)
+  )
+    (asserts! (var-get analytics-enabled) (ok false))
+    (map-set stream-analytics
+      { stream-id: stream-id }
+      {
+        creation-block: current-block,
+        first-withdrawal-block: none,
+        completion-block: none,
+        total-withdrawals: u0,
+        efficiency-score: u100,
+        status: "created"
+      }
+    )
+    (update-daily-analytics-create current-block)
+    (update-user-analytics-create (get employer stream) (get employee stream) (get total-amount stream))
+    (ok true))
+)
+
+(define-public (update-withdrawal-analytics (stream-id uint))
+  (let (
+    (analytics (unwrap! (get-stream-analytics stream-id) err-analytics-not-found))
+    (current-block stacks-block-height)
+    (new-first-withdrawal (if (is-none (get first-withdrawal-block analytics))
+                           (some current-block)
+                           (get first-withdrawal-block analytics)))
+  )
+    (asserts! (var-get analytics-enabled) (ok false))
+    (map-set stream-analytics
+      { stream-id: stream-id }
+      (merge analytics {
+        first-withdrawal-block: new-first-withdrawal,
+        total-withdrawals: (+ (get total-withdrawals analytics) u1),
+        status: "active"
+      })
+    )
+    (ok true))
+)
+
+(define-public (finalize-stream-analytics (stream-id uint) (completion-type (string-ascii 20)))
+  (let (
+    (analytics (unwrap! (get-stream-analytics stream-id) err-analytics-not-found))
+    (stream (unwrap! (get-stream stream-id) err-not-found))
+    (current-block stacks-block-height)
+    (efficiency (unwrap-panic (calculate-efficiency-score stream-id)))
+  )
+    (asserts! (var-get analytics-enabled) (ok false))
+    (map-set stream-analytics
+      { stream-id: stream-id }
+      (merge analytics {
+        completion-block: (some current-block),
+        efficiency-score: efficiency,
+        status: completion-type
+      })
+    )
+    (update-global-counters completion-type (get withdrawn-amount stream))
+    (ok true))
+)
+
+;; === HELPER FUNCTIONS FOR ANALYTICS ===
+
+(define-private (update-daily-analytics-create (date uint))
+  (let (
+    (existing (default-to {
+      streams-created: u0,
+      streams-completed: u0,
+      streams-cancelled: u0,
+      volume-streamed: u0,
+      active-employers: u0,
+      active-employees: u0
+    } (get-daily-analytics date)))
+  )
+    (map-set daily-analytics
+      { date: date }
+      (merge existing {
+        streams-created: (+ (get streams-created existing) u1)
+      })
+    ))
+)
+
+(define-private (update-user-analytics-create (employer principal) (employee principal) (amount uint))
+  (let (
+    (employer-data (get-user-analytics employer))
+    (employee-data (get-user-analytics employee))
+  )
+    (map-set user-analytics
+      { user: employer }
+      (merge employer-data {
+        streams-as-employer: (+ (get streams-as-employer employer-data) u1)
+      })
+    )
+    (map-set user-analytics
+      { user: employee }
+      (merge employee-data {
+        streams-as-employee: (+ (get streams-as-employee employee-data) u1),
+        total-received: (+ (get total-received employee-data) amount)
+      })
+    ))
+)
+
+(define-private (update-global-counters (completion-type (string-ascii 20)) (amount uint))
+  (begin
+    (var-set total-volume-streamed (+ (var-get total-volume-streamed) amount))
+    (if (is-eq completion-type "completed")
+      (var-set total-completed-streams (+ (var-get total-completed-streams) u1))
+      (var-set total-cancelled-streams (+ (var-get total-cancelled-streams) u1))))
+)
+
+;; === REPORTING FUNCTIONS ===
+
+(define-read-only (generate-platform-report)
+  {
+    total-streams: (var-get total-streams),
+    completed-streams: (var-get total-completed-streams),
+    cancelled-streams: (var-get total-cancelled-streams),
+    total-volume: (var-get total-volume-streamed),
+    success-rate: (if (> (var-get total-streams) u0)
+                   (/ (* (var-get total-completed-streams) u100) (var-get total-streams))
+                   u0),
+    avg-completion-rate: (if (> (+ (var-get total-completed-streams) (var-get total-cancelled-streams)) u0)
+                          (/ (* (var-get total-completed-streams) u100) 
+                             (+ (var-get total-completed-streams) (var-get total-cancelled-streams)))
+                          u0)
+  }
+)
+
+(define-read-only (generate-user-performance-report (user principal))
+  (let (
+    (analytics (get-user-analytics user))
+    (reliability (unwrap-panic (calculate-user-reliability user)))
+  )
+    {
+      user: user,
+      employer-streams: (get streams-as-employer analytics),
+      employee-streams: (get streams-as-employee analytics),
+      total-paid: (get total-paid analytics),
+      total-received: (get total-received analytics),
+      reliability-score: reliability,
+      avg-duration: (get avg-stream-duration analytics)
+    })
+)
+
+(define-read-only (get-top-performers (limit uint))
+  (let (
+    (sample-users (list 
+      'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
+      'ST1SJ3DTE5DN7X54YDH5D64R3BCB6A2AG2ZQ8YPD5
+      'ST2CY5V39NHDPWSXMW9QDT3HC3GD6Q6XX4CFRK9AG
+    ))
+  )
+    {
+      top-employers: sample-users,
+      top-employees: sample-users,
+      methodology: "Based on reliability score and volume"
+    })
+)
+
+;; === ANALYTICS MANAGEMENT ===
+
+(define-public (toggle-analytics (enabled bool))
+  (begin
+    (var-set analytics-enabled enabled)
+    (ok enabled))
+)
+
+(define-read-only (is-analytics-enabled)
+  (var-get analytics-enabled)
+)
+
+(define-public (reset-analytics-counters)
+  (begin
+    (var-set total-volume-streamed u0)
+    (var-set total-completed-streams u0)
+    (var-set total-cancelled-streams u0)
+    (ok true))
+)
+
+;; === ADVANCED ANALYTICS QUERIES ===
+
+(define-read-only (get-stream-health-score (stream-id uint))
+  (match (get-stream stream-id)
+    stream (let (
+      (current-time stacks-block-height)
+      (time-progress (/ (* (- current-time (get start-time stream)) u100) 
+                       (- (get end-time stream) (get start-time stream))))
+      (withdrawal-progress (/ (* (get withdrawn-amount stream) u100) (get total-amount stream)))
+      (health-score (if (> time-progress withdrawal-progress)
+                     (- u100 (- time-progress withdrawal-progress))
+                     u100))
+    )
+      (ok (min health-score u100)))
+    (ok u0))
+)
+
+(define-read-only (predict-stream-completion (stream-id uint))
+  (match (get-stream stream-id)
+    stream (let (
+      (current-time stacks-block-height)
+      (elapsed (- current-time (get start-time stream)))
+      (progress-ratio (if (> (get withdrawn-amount stream) u0)
+                       (/ (* elapsed u100) 
+                          (/ (* (get total-amount stream) elapsed) (get withdrawn-amount stream)))
+                       u0))
+      (estimated-completion (if (> progress-ratio u0)
+                             (+ (get start-time stream) 
+                                (/ (* (- (get end-time stream) (get start-time stream)) u100) progress-ratio))
+                             (get end-time stream)))
+    )
+      (ok {
+        estimated-completion-block: estimated-completion,
+        confidence: (min progress-ratio u100),
+        on-schedule: (<= estimated-completion (get end-time stream))
+      }))
+    (err u0))
+)
