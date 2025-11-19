@@ -18,6 +18,24 @@
 (define-constant err-vesting-schedule-exists (err u110))
 (define-constant err-stream-already-ended (err u111))
 (define-constant err-insufficient-time-elapsed (err u112))
+(define-constant err-not-authorized-delegate (err u113))
+(define-constant err-delegate-already-exists (err u114))
+(define-constant err-no-delegation (err u115))
+
+(define-map stream-delegates
+  { employer: principal, delegate: principal }
+  { is-active: bool }
+)
+
+(define-read-only (is-authorized (employer principal) (caller principal))
+  (if (is-eq employer caller)
+    true
+    (match (map-get? stream-delegates { employer: employer, delegate: caller })
+      delegation (get is-active delegation)
+      false)))
+
+(define-read-only (get-delegate-status (employer principal) (delegate principal))
+  (map-get? stream-delegates { employer: employer, delegate: delegate }))
 
 
 (define-map salary-streams
@@ -61,6 +79,22 @@
 (define-read-only (get-vesting-schedule (stream-id uint))
   (map-get? vesting-schedules { stream-id: stream-id })
 )
+
+(define-public (grant-delegation (delegate principal))
+  (begin
+    (map-set stream-delegates
+      { employer: tx-sender, delegate: delegate }
+      { is-active: true }
+    )
+    (ok true)))
+
+(define-public (revoke-delegation (delegate principal))
+  (begin
+    (map-set stream-delegates
+      { employer: tx-sender, delegate: delegate }
+      { is-active: false }
+    )
+    (ok true)))
 
 (define-read-only (calculate-available-amount (stream-id uint))
   (let (
@@ -153,7 +187,7 @@
 
 (define-public (pause-stream (stream-id uint))
   (let ((stream (unwrap! (get-stream stream-id) err-not-found)))
-    (asserts! (is-eq tx-sender (get employer stream)) err-owner-only)
+    (asserts! (is-authorized (get employer stream) tx-sender) err-not-authorized-delegate)
     (asserts! (get is-active stream) err-stream-inactive)
     (map-set salary-streams
       { stream-id: stream-id }
@@ -164,7 +198,7 @@
 
 (define-public (resume-stream (stream-id uint))
   (let ((stream (unwrap! (get-stream stream-id) err-not-found)))
-    (asserts! (is-eq tx-sender (get employer stream)) err-owner-only)
+    (asserts! (is-authorized (get employer stream) tx-sender) err-not-authorized-delegate)
     (asserts! (not (get is-active stream)) err-stream-active)
     (map-set salary-streams
       { stream-id: stream-id }
@@ -401,7 +435,7 @@
     (refund-amount (- (get total-amount stream) earned-amount))
     (employee-payment (- earned-amount (get withdrawn-amount stream)))
   )
-    (asserts! (is-eq tx-sender (get employer stream)) err-owner-only)
+    (asserts! (is-authorized (get employer stream) tx-sender) err-not-authorized-delegate)
     (asserts! (get is-active stream) err-stream-inactive)
     (asserts! (< current-time (get end-time stream)) err-stream-already-ended)
     (asserts! (> (- current-time (get start-time stream)) u10) err-insufficient-time-elapsed)
